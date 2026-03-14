@@ -4,9 +4,8 @@ use url::Url;
 pub fn series(count: usize, base_url: Url) -> Markup {
     html! {
         @for i in (1..=count).rev() {
-            @let path = format!("{}/{}", "chapters", i);
             div {
-                a href=(base_url.join(path.as_str()).unwrap()) {}
+                a href=(base_url.join(&format!("chapters/{}", i)).unwrap()) {}
             }
         }
     }
@@ -15,8 +14,7 @@ pub fn series(count: usize, base_url: Url) -> Markup {
 pub fn chapter(count: usize, base_url: Url, chapter_id: usize) -> Markup {
     html! {
         @for i in 1..=count {
-            @let path = format!("{}/{}-{}.png", "images", chapter_id, i);
-            img src=(base_url.join(path.as_str()).unwrap());
+            img src=(base_url.join(&format!("images/{}-{}.png", chapter_id, i)).unwrap());
         }
     }
 }
