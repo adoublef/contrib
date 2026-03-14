@@ -227,7 +227,7 @@ mod test {
             let mut file = File::create("test.zip").await?;
             let mut stream = StreamReader::new(response.bytes_stream().map_err(io::Error::other));
 
-            assert!(tokio::io::copy(&mut stream, &mut file).await? > 0);
+            assert!(copy(&mut stream, &mut file).await? > 0);
         };
 
         let mut num_files = 0;
