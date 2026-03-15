@@ -38,7 +38,7 @@ async fn zip_chapter(
     concurrency: usize,
 ) -> Pin<Box<impl Stream<Item = Result<Bytes, io::Error>>>> {
     let (rx, tx) = duplex(4 * 1 << 10);
-    let worker = spawn(async move {
+    let fut = spawn(async move {
         let mut series_zip = ZipFileWriter::with_tokio(tx).force_zip64();
 
         chapter_url
@@ -110,7 +110,7 @@ async fn zip_chapter(
             let msg = msg?;
             yield msg
         }
-        worker.await?.map_err(io::Error::other)?
+        fut.await?.map_err(io::Error::other)?
     })
 }
 
@@ -119,7 +119,7 @@ async fn zip_series(
     mut series_url: Url,
 ) -> impl Stream<Item = Result<Bytes, io::Error>> {
     let (rx, tx) = duplex(4 * 1 << 10);
-    let worker = spawn(async move {
+    let fut = spawn(async move {
         let mut series_zip = ZipFileWriter::with_tokio(tx).force_zip64();
 
         series_url
@@ -172,7 +172,7 @@ async fn zip_series(
             let msg = msg?; // Result<Bytes, Error>
             yield msg
         }
-        worker.await?.map_err(io::Error::other)?
+        fut.await?.map_err(io::Error::other)?
     }
 }
 

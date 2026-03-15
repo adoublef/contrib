@@ -39,7 +39,7 @@ pub struct Order {
 
 async fn csv_reader(client: Client, base_url: Url) -> impl Stream<Item = Result<Bytes, io::Error>> {
     let (rx, tx) = duplex(4 * 1 << 10);
-    let worker = spawn(async move {
+    let fut = spawn(async move {
         // create csv writer
         let mut wri = AsyncSerializer::from_writer(tx);
         // TODO - stream json body
@@ -142,7 +142,7 @@ async fn csv_reader(client: Client, base_url: Url) -> impl Stream<Item = Result<
             let msg = msg?; // Result<Bytes, Error>
             yield msg
         }
-        worker.await?.map_err(io::Error::other)?
+        fut.await?.map_err(io::Error::other)?
     }
 }
 
