@@ -16,7 +16,7 @@ use reqwest::{Client, StatusCode, header};
 use serde::Deserialize;
 use std::{io, pin::Pin};
 use tokio::{
-    io::{copy, duplex},
+    io::{AsyncWriteExt, copy, duplex},
     spawn,
     sync::mpsc,
     task::spawn_blocking,
@@ -35,6 +35,7 @@ pub fn app(client: Client) -> Router {
 async fn zip_chapter(
     client: Client,
     mut chapter_url: Url,
+    concurrency: usize,
 ) -> Pin<Box<impl Stream<Item = Result<Bytes, io::Error>>>> {
     let (rx, tx) = duplex(4 * 1 << 10);
     let worker = spawn(async move {
@@ -61,17 +62,29 @@ async fn zip_chapter(
             Ok::<_, anyhow::Error>(())
         });
         // use rx
-        let mut stream = ReceiverStream::new(rx).enumerate();
-        while let Some((ix, image_url)) = stream.next().await {
-            // want to use a try_each_concurrency closure
-            let response = client
-                .get(image_url)
-                .send()
-                .await?
-                .error_for_status()?
-                .bytes_stream();
-            let mut image_stream = StreamReader::new(response.map_err(io::Error::other));
+        let stream = ReceiverStream::new(rx);
+        let mut stream = stream
+            .map(move |image_url| {
+                let client = client.clone();
+                async move {
+                    let body = client
+                        .get(image_url)
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        // max size?
+                        .bytes()
+                        .await?;
+                    // write to a bytes buffer to avoid wasting network resources
+                    // limit the size as well.
+                    Ok::<_, anyhow::Error>(body)
+                }
+            })
+            .buffer_unordered(concurrency) // how do i know this is working?
+            .enumerate();
 
+        while let Some((ix, image_body)) = stream.next().await {
+            let mut image_body = image_body?;
             let mut chapter_entry = series_zip
                 .write_entry_stream(
                     ZipEntryBuilder::new(format!("image-{ix}.png").into(), Compression::Stored)
@@ -80,7 +93,7 @@ async fn zip_chapter(
                 .await?
                 .compat_write();
 
-            copy(&mut image_stream, &mut chapter_entry).await?;
+            chapter_entry.write_all(&mut image_body).await?;
             chapter_entry.into_inner().close().await?;
         }
         worker.await??;
@@ -93,7 +106,7 @@ async fn zip_chapter(
     // https://without.boats/blog/pin/
     Box::pin(try_stream! {
         while let Some(msg) = stream.next().await {
-            let msg = msg?; // Result<Bytes, Error>
+            let msg = msg?;
             yield msg
         }
         worker.await?.map_err(io::Error::other)?
@@ -133,7 +146,7 @@ async fn zip_series(
         let mut stream = ReceiverStream::new(rx).enumerate();
         while let Some((ix, chapter_url)) = stream.next().await {
             let mut chapter_stream =
-                StreamReader::new(zip_chapter(client.clone(), chapter_url.clone()).await);
+                StreamReader::new(zip_chapter(client.clone(), chapter_url.clone(), 1).await);
 
             let mut chapter_entry = series_zip
                 .write_entry_stream(
