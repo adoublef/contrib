@@ -14,10 +14,10 @@ use futures_util::StreamExt;
 use futures_util::{Stream, TryStreamExt};
 use reqwest::{Client, StatusCode, header};
 use serde::Deserialize;
-use std::io;
+use std::{io, pin::Pin};
 use tokio::{
     io::{copy, duplex},
-    pin, spawn,
+    spawn,
     sync::mpsc,
     task::spawn_blocking,
 };
@@ -35,7 +35,7 @@ pub fn app(client: Client) -> Router {
 async fn zip_chapter(
     client: Client,
     mut chapter_url: Url,
-) -> impl Stream<Item = Result<Bytes, io::Error>> {
+) -> Pin<Box<impl Stream<Item = Result<Bytes, io::Error>>>> {
     let (rx, tx) = duplex(4 * 1 << 10);
     let worker = spawn(async move {
         let mut series_zip = ZipFileWriter::with_tokio(tx).force_zip64();
@@ -90,13 +90,14 @@ async fn zip_chapter(
     });
 
     let mut stream = ReaderStream::new(rx);
-    try_stream! {
+    // https://without.boats/blog/pin/
+    Box::pin(try_stream! {
         while let Some(msg) = stream.next().await {
             let msg = msg?; // Result<Bytes, Error>
             yield msg
         }
         worker.await?.map_err(io::Error::other)?
-    }
+    })
 }
 
 async fn zip_series(
@@ -131,10 +132,8 @@ async fn zip_series(
 
         let mut stream = ReceiverStream::new(rx).enumerate();
         while let Some((ix, chapter_url)) = stream.next().await {
-            let chapter_stream =
+            let mut chapter_stream =
                 StreamReader::new(zip_chapter(client.clone(), chapter_url.clone()).await);
-            // https://without.boats/blog/pin/
-            pin!(chapter_stream);
 
             let mut chapter_entry = series_zip
                 .write_entry_stream(
