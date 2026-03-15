@@ -75,10 +75,7 @@ async fn csv_reader(client: Client, base_url: Url) -> impl Stream<Item = Result<
                                 .context("Missing x-pages header")?
                                 .to_str()?
                                 .parse::<u32>()?;
-                            // we now know the pages, so lets query each page
-                            // this next query needs to be limited too
-                            // while let Some((region, page)) =
-                            //     iter(1..=last).map(move |page| (region, page)).next().await
+
                             for page in 1..=last {
                                 tx.send((region, page)).await?;
                             }
@@ -86,7 +83,6 @@ async fn csv_reader(client: Client, base_url: Url) -> impl Stream<Item = Result<
                         }
                     })
                     .await?;
-                // drop(tx);
                 Ok::<_, anyhow::Error>(())
             }
         });
