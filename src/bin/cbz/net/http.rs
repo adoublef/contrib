@@ -67,17 +67,18 @@ async fn zip_chapter(
             .map(move |image_url| {
                 let client = client.clone();
                 async move {
-                    let body = client
+                    let response = client
                         .get(image_url)
                         .send()
                         .await?
                         .error_for_status()?
-                        // max size?
                         .bytes()
                         .await?;
-                    // write to a bytes buffer to avoid wasting network resources
-                    // limit the size as well.
-                    Ok::<_, anyhow::Error>(body)
+                    // let content_length = response.content_length().unwrap_or(0);
+                    // let response_stream =
+                    //     &mut Limited::new(response.bytes_stream(), content_length as usize);
+
+                    Ok::<_, anyhow::Error>(response)
                 }
             })
             .buffer_unordered(concurrency) // how do i know this is working?
