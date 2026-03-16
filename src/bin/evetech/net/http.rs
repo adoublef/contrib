@@ -177,7 +177,7 @@ mod test {
     use futures_util::TryStreamExt;
     use reqwest::{Client, StatusCode, header};
     use std::io;
-    use tokio::{net::TcpListener, spawn};
+    use tokio::{net::TcpListener, spawn, task::JoinHandle};
     use tokio_stream::StreamExt;
     use tokio_util::io::StreamReader;
     use url::Url;
