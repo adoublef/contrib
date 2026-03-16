@@ -207,7 +207,9 @@ mod test {
         ));
         let mut records = rdr.records();
         let mut num_records = 0;
-        while let Some(_record) = records.next().await {
+        while let Some(record) = records.next().await {
+            let record = record?;
+            assert_eq!(record.len(), 12);
             num_records += 1;
         }
         assert_eq!(num_records, num_regions * num_pages * num_orders);
