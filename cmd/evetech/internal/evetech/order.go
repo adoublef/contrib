@@ -17,9 +17,8 @@ type Order struct {
 	VolumeTotal  int     `json:"volume_total"`
 }
 
-func (o Order) Record() []string {
-	return []string{
-		strconv.Itoa(o.Duration),
+func (o Order) Record() [12]string {
+	return [12]string{strconv.Itoa(o.Duration),
 		strconv.FormatBool(o.IsBuyOrder),
 		o.Issued,
 		strconv.Itoa(o.LocationID),

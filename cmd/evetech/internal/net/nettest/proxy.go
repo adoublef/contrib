@@ -71,9 +71,9 @@ const (
 
 func (s Stream) String() string {
 	if s {
-		return "downstream"
+		return "upstream"
 	}
-	return "upstream"
+	return "downstream"
 }
 
 type Server struct {

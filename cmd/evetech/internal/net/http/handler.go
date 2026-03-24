@@ -7,13 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"runtime/trace"
 	"strconv"
 
-	"github.com/adoublef/contrib/cmd/evetech/internal/encoding/json/jsonstream"
+	"github.com/adoublef/contrib/cmd/evetech/internal/encoding/jsonl"
 	"github.com/adoublef/contrib/cmd/evetech/internal/evetech"
 	"golang.org/x/sync/errgroup"
 )
@@ -28,180 +27,85 @@ func IsServerClosed(err error) bool {
 }
 
 func Handler(httpC *http.Client) http.Handler {
-	return handleFunc(httpC)
+	return handleCSV(httpC)
 }
 
-func handleFunc(httpC *http.Client) handlerFunc {
-	parse := func(_ http.ResponseWriter, r *http.Request) (base *url.URL, pages, orders int, err error) {
-		u, err := url.Parse(r.URL.Query().Get("base_url"))
+func csvStream(ctx context.Context, httpC *http.Client, u *url.URL, hasHeader bool) io.ReadCloser {
+	g, ctx := errgroup.WithContext(ctx)
+
+	regions := make(chan uint64)
+	g.Go(func() error {
+		ctx, task := trace.NewTask(ctx, "regions")
+		defer func() { close(regions); task.End() }()
+
+		rc, err := get(ctx, httpC, "%s://%s/v1/universe/regions", u.Scheme, u.Host)
 		if err != nil {
-			return nil, 0, 0, httpError(http.StatusBadRequest)
-		} else if u.Path != "" || u.String() == "" { // cannot be empty
-			return nil, 0, 0, httpError(http.StatusUnprocessableEntity)
+			return fmt.Errorf("failed to query regions: %w", err)
 		}
-		// pages (optional)
-		// parse & with best-effort use the value
-		// dont fully care for the error
-		pages, _ = strconv.Atoi(r.URL.Query().Get("par_regions"))
-		orders, _ = strconv.Atoi(r.URL.Query().Get("par_pages"))
-		return u, max(min(pages, 100), 1), max(min(orders, 100), 1), err
-	}
+		defer rc.Close()
 
-	csvReader := func(ctx context.Context, base *url.URL, parRegions, parPages int) io.ReadCloser {
-		g, ctx := errgroup.WithContext(ctx)
-		g.SetLimit(5)
-
-		regions := make(chan int)
-		g.Go(func() error {
-			ctx, task := trace.NewTask(ctx, "region")
-			defer task.End()
-
-			defer close(regions)
-
-			base := base.JoinPath("v1", "universe", "regions")
-			req, err1 := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
-			// NOTE seem to not be allowed to set a region
-			// around a http request. this may be conflicting with
-			// internal package calls? chek issues
-			// call := trace.StartRegion(ctx, "httpRequest")
-			res, err2 := httpC.Do(req)
-			if err := cmp.Or(err1, err2); err != nil {
-				// call.End()
+		for id, err := range jsonl.Decode[uint64](rc) {
+			if err != nil {
 				return err
 			}
-			// call.End()
-			defer res.Body.Close()
-
-			if c := res.StatusCode; c != http.StatusOK {
-				return fmt.Errorf("failed query returned %d status code", c)
-			}
-
-			defer trace.StartRegion(ctx, "decode").End()
-			for id, err := range jsonstream.Decode[int](io.LimitReader(res.Body, res.ContentLength)) {
-				if err != nil {
-					return err
-				}
-				wait := trace.StartRegion(ctx, "wait")
-				select {
-				case <-ctx.Done():
-					wait.End()
-					return ctx.Err()
-				case regions <- id:
-				}
+			wait := trace.StartRegion(ctx, "wait")
+			select {
+			case <-ctx.Done():
+				wait.End()
+				return ctx.Err()
+			case regions <- id:
 				wait.End()
 			}
+		}
+		return nil
+	})
 
-			return nil
-		})
+	type query struct {
+		region, page uint64 // n > 0
+	}
+	queries := make(chan query)
+	g.Go(func() error {
+		defer func() { close(queries) }()
 
-		type page struct{ region, n int }
-		pages := make(chan page)
-		g.Go(func() error {
-			defer close(pages)
+		g, ctx := errgroup.WithContext(ctx)
+		g.SetLimit(1 << 0)
+		for region := range regions {
+			g.Go(func() error {
+				ctx, task := trace.NewTask(ctx, "pages")
+				defer func() { task.End() }()
 
-			g, ctx := errgroup.WithContext(ctx)
-			g.SetLimit(parRegions)
-			for region := range regions {
-				g.Go(func() error {
-					ctx, task := trace.NewTask(ctx, "pages")
-					defer task.End()
+				h, err1 := head(ctx, httpC, "%s://%s/v1/markets/%d/orders", u.Scheme, u.Host, region)
+				n, err2 := strconv.ParseUint(h.Get("x-pages"), 10, 64)
+				if err := cmp.Or(err1, err2); err != nil {
+					return fmt.Errorf("failed to fetch max-page")
+				} // else if n < 1
 
-					// net call
-					base := base.JoinPath("v1", "markets", strconv.Itoa(region), "orders")
-					req, err1 := http.NewRequestWithContext(ctx, http.MethodHead, base.String(), nil)
-					// call := trace.StartRegion(ctx, "syscall")
-					res, err2 := httpC.Do(req)
-					if err := cmp.Or(err1, err2); err != nil {
-						// call.End()
-						return err
-					}
-					// call.End()
-					defer res.Body.Close()
-
-					if c := res.StatusCode; c != http.StatusOK {
-						return fmt.Errorf("failed query returned %d status code", c)
-					}
-
-					max, err := strconv.Atoi(res.Header.Get("x-pages"))
-					if err != nil {
-						return err
-					}
-
-					for n := 1; n <= max; n++ {
-						wait := trace.StartRegion(ctx, "wait")
-						select {
-						case <-ctx.Done():
-							wait.End()
-							return ctx.Err()
-						case pages <- page{region, n}:
-						}
+				for i := range n {
+					wait := trace.StartRegion(ctx, "wait")
+					select {
+					case <-ctx.Done():
+						wait.End()
+						return ctx.Err()
+					case queries <- query{region, i + 1}:
 						wait.End()
 					}
-					return nil
-				})
-			}
-			return g.Wait()
-		})
+				}
+				return nil
+			})
+		}
+		return g.Wait()
+	})
 
-		records := make(chan []string)
-		g.Go(func() error {
-			defer close(records)
+	records := make(chan [12]string)
+	g.Go(func() error {
+		defer func() { close(records) }()
 
-			g, ctx := errgroup.WithContext(ctx)
-			g.SetLimit(parPages)
-			for page := range pages {
-				g.Go(func() error {
-					ctx, task := trace.NewTask(ctx, "orders")
-					defer task.End()
-
-					base := base.JoinPath("v1", "markets", strconv.Itoa(page.region), "orders")
-					v := make(url.Values)
-					v.Set("page", strconv.Itoa(page.n))
-					base.RawQuery = v.Encode()
-
-					req, err1 := http.NewRequestWithContext(ctx, http.MethodGet, base.String(), nil)
-					// call := trace.StartRegion(ctx, "syscall")
-					res, err2 := httpC.Do(req)
-					if err := cmp.Or(err1, err2); err != nil {
-						// call.End()
-						return err
-					}
-					// call.End()
-					defer res.Body.Close()
-					if c := res.StatusCode; c != http.StatusOK {
-						return fmt.Errorf("failed query returned %d status code", c)
-					}
-
-					defer trace.StartRegion(ctx, "decode").End()
-					for o, err := range jsonstream.Decode[evetech.Order](io.LimitReader(res.Body, res.ContentLength)) {
-						if err != nil {
-							return err
-						}
-						wait := trace.StartRegion(ctx, "wait")
-						select {
-						case <-ctx.Done():
-							wait.End()
-							return ctx.Err()
-						case records <- o.Record():
-						}
-						wait.End()
-					}
-					return nil
-				})
-			}
-			return g.Wait()
-		})
-
-		pr, pw := io.Pipe()
-		g.Go(func() error {
-			ctx, task := trace.NewTask(ctx, "pipe")
-			defer task.End()
-
-			cw := csv.NewWriter(&ctxWriter{ctx: ctx, Writer: pw}) // need to wrap the wrtier
-			cw.UseCRLF = true
-
-			// write the header
-			if err := cw.Write([]string{
+		// send the header if hasHeader is set
+		if hasHeader {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case records <- [12]string{
 				"duration",
 				"is_buy_order",
 				"issued",
@@ -214,68 +118,120 @@ func handleFunc(httpC *http.Client) handlerFunc {
 				"type_id",
 				"volume_remain",
 				"volume_total",
-			}); err != nil {
-				return err
+			}:
 			}
+		}
 
-			for record := range records {
-				if err := cw.Write(record); err != nil {
-					return err
+		g, ctx := errgroup.WithContext(ctx)
+		g.SetLimit(1 << 0)
+		for query := range queries {
+			g.Go(func() error {
+				ctx, task := trace.NewTask(ctx, "orders")
+				defer func() { task.End() }()
+
+				rs, err := get(ctx, httpC, "%s://%s/v1/markets/%d/orders?page=%d", u.Scheme, u.Host, query.region, query.page)
+				if err != nil {
+					return fmt.Errorf("failed to fetch orders: %w", err)
 				}
-			}
-			cw.Flush()
-			if err := cw.Error(); err != nil {
+				defer rs.Close()
+
+				for o, err := range jsonl.Decode[evetech.Order](rs) {
+					if err != nil {
+						return err
+					}
+					wait := trace.StartRegion(ctx, "wait")
+					select {
+					case <-ctx.Done():
+						wait.End()
+						return ctx.Err()
+					case records <- o.Record():
+						wait.End()
+					}
+				}
+				return nil
+			})
+		}
+		return g.Wait()
+	})
+
+	pr, pw := io.Pipe() // there is no buffer here
+	g.Go(func() error {
+		cw := csv.NewWriter(pw) // 4*1<<10 buffer
+		cw.UseCRLF = true
+
+		for record := range records {
+			// or do i create record local here
+			if err := cmp.Or(cw.Write(record[:]), ctx.Err()); err != nil {
 				return err
 			}
-			return nil
-		})
+		}
+		cw.Flush()
 
-		go func() { pw.CloseWithError(g.Wait()) }()
-		return pr
+		return cw.Error()
+	})
+
+	go func() { pw.CloseWithError(g.Wait()) }()
+	return pr
+}
+
+func handleCSV(httpC *http.Client) HandlerFunc {
+	parse := func(_ http.ResponseWriter, r *http.Request) (base *url.URL, hasHeader bool, err error) {
+		u, err := url.Parse(r.URL.Query().Get("base_url"))
+		// we need a bool but its optional
+		return u, false, err
 	}
+
 	return func(w http.ResponseWriter, r *http.Request) error {
 		ctx, task := trace.NewTask(r.Context(), "handleFunc")
 		defer task.End()
 
-		base, pages, orders, err := parse(w, r)
+		u, has, err := parse(w, r)
 		if err != nil {
 			return err
 		}
 
-		cr := csvReader(ctx, base, pages, orders)
+		cr := csvStream(ctx, httpC, u, has)
 		defer cr.Close()
 
-		_, err = io.Copy(w, cr)
+		h := w.Header()
+		h.Set("Content-Type", "text/csv")
+		h.Set("Content-Disposition", "attachment; filename=\"evetech.csv\"")
+
+		_, err = io.CopyBuffer(w, cr, nil)
 		return err
 	}
 }
 
-type handlerFunc func(w http.ResponseWriter, r *http.Request) error
+type HandlerFunc func(w http.ResponseWriter, r *http.Request) error
 
-func (h handlerFunc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	err := h(w, r)
-	if err == nil {
-		return
-	}
+func (h HandlerFunc) ServeHTTP(w http.ResponseWriter, r *http.Request) { _ = h(w, r) }
 
-	if err, ok := errors.AsType[httpError](err); ok {
-		http.Error(w, err.Error(), int(err))
-		return
+type StatusCode int
+
+func (e StatusCode) Error() string { return http.StatusText(int(e)) }
+
+func get(ctx context.Context, httpC *http.Client, format string, v ...any) (io.ReadCloser, error) {
+	req, err1 := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf(format, v...), nil)
+	res, err2 := httpC.Do(req)
+	if err := cmp.Or(err1, err2); err != nil {
+		return nil, err
 	}
-	log.Printf("unexpected error: %v\n", err)
+	if c := res.StatusCode; c != http.StatusOK {
+		_ = res.Body.Close()
+		return nil, StatusCode(c)
+	}
+	return res.Body, nil
 }
 
-type httpError int
-
-func (e httpError) Error() string { return http.StatusText(int(e)) }
-
-type ctxWriter struct {
-	ctx context.Context
-	io.Writer
-}
-
-func (w *ctxWriter) Write(p []byte) (int, error) {
-	// trace per call or just make a region
-	n, err := w.Writer.Write(p)
-	return n, cmp.Or(err, w.ctx.Err())
+func head(ctx context.Context, httpC *http.Client, format string, v ...any) (http.Header, error) {
+	req, err1 := http.NewRequestWithContext(ctx, http.MethodHead, fmt.Sprintf(format, v...), nil)
+	res, err2 := httpC.Do(req)
+	if err := cmp.Or(err1, err2); err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if c := res.StatusCode; c != http.StatusOK {
+		return make(http.Header), StatusCode(c)
+	}
+	return res.Header, nil
 }

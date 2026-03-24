@@ -1,4 +1,4 @@
-package jsonstream
+package jsonl
 
 import (
 	"encoding/json"

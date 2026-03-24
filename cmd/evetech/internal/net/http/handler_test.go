@@ -4,14 +4,12 @@ import (
 	"cmp"
 	"encoding/csv"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -20,42 +18,26 @@ import (
 	"github.com/adoublef/contrib/cmd/evetech/internal/net/nettest"
 )
 
-var numRegions, numPages, numOrders int
-
-// parRegions is concerned with number of parallel region requests can occure at once
-// parRegions is concerned with number of parallel page request can occure at once
-var parRegions, parPages int
-
-func init() {
-	flag.IntVar(&numRegions, "regions", 1, "number of regions")
-	flag.IntVar(&numPages, "pages", 1, "number of pages")
-	flag.IntVar(&numOrders, "orders", 1, "number of orders")
-	flag.IntVar(&parRegions, "par-regions", 1, "parallel region processes")
-	flag.IntVar(&parPages, "par-pages", 1, "parallel pages processes")
-}
-
 func TestHandler(t *testing.T) {
 	t.Run("OK", func(t *testing.T) {
 		ctx := t.Context()
 
-		proxyS := newProxyServer(t)
+		const numRegions = 1 << 3
+		const numPages = 1 << 3
+		const numOrders = 1 << 3
 
-		apiC, apiURL := apiClient(t, proxyS, numRegions, numPages, numOrders)
-
+		apiC, apiURL := apiClient(t, numRegions, numPages, numOrders)
 		c, sURL := testClient(t, apiC)
 
-		v := make(url.Values)
-		v.Set("base_url", apiURL)
-		v.Set("par_regions", strconv.Itoa(parRegions))
-		v.Set("par_pages", strconv.Itoa(parPages))
-
-		url := fmt.Sprintf(`%s?%s`, sURL, v.Encode())
+		url := fmt.Sprintf(`%s/?base_url=%s`, sURL, apiURL)
 		req, err1 := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		res, err2 := c.Do(req)
 		ok(t, cmp.Or(err1, err2))
 		defer res.Body.Close()
 
 		equal(t, res.StatusCode, http.StatusOK)
+		equal(t, res.Header.Get("Content-Type"), "text/csv")
+		// check content-disposition
 
 		cr := csv.NewReader(res.Body)
 		cr.ReuseRecord = true
@@ -74,20 +56,25 @@ func TestHandler(t *testing.T) {
 		}
 		ok(t, res.Body.Close())
 
-		equal(t, n, 1+(numRegions*numPages*numOrders)) // include the header
+		// do we include the header?
+
+		equal(t, n, 0+(numRegions*numPages*numOrders)) // include the header
 	})
 }
 
-func BenchmarkHandler(b *testing.B) { benchmarkHandler(b, 10, 50, 100, 1, 1) }
+// func BenchmarkHandler_0(b *testing.B) { benchmarkHandler(b, 1<<0, 1<<0, 1<<0) }
+// func BenchmarkHandler_1(b *testing.B) { benchmarkHandler(b, 1<<1, 1<<1, 1<<1) }
+// func BenchmarkHandler_2(b *testing.B) { benchmarkHandler(b, 1<<2, 1<<2, 1<<2) }
+// func BenchmarkHandler_3(b *testing.B) { benchmarkHandler(b, 1<<3, 1<<3, 1<<3) }
+// func BenchmarkHandler_4(b *testing.B) { benchmarkHandler(b, 1<<4, 1<<4, 1<<4) }
+// func BenchmarkHandler_5(b *testing.B) { benchmarkHandler(b, 1<<5, 1<<5, 1<<5) }
 
-func benchmarkHandler(b *testing.B, numRegions, numPages, numOrders, parRegions, parPages int) {
-	apiC, apiURL := apiClient(b, nil, numRegions, numPages, numOrders)
+func benchmarkHandler(b *testing.B, numRegions, numPages, numOrders int) {
+	apiC, apiURL := apiClient(b, numRegions, numPages, numOrders)
 	httpC, sURL := testClient(b, apiC)
 
 	v := make(url.Values)
 	v.Set("base_url", apiURL)
-	v.Set("par_regions", strconv.Itoa(parRegions))
-	v.Set("par_pages", strconv.Itoa(parPages))
 	url := fmt.Sprintf(`%s?%s`, sURL, v.Encode())
 
 	for b.Loop() {
@@ -106,6 +93,7 @@ func testClient(t testing.TB, httpC *http.Client) (*http.Client, string) {
 
 	s := httptest.NewServer(Handler(httpC))
 	t.Cleanup(func() { s.Close() })
+
 	return s.Client(), s.URL
 }
 
@@ -123,73 +111,77 @@ func equal[K comparable](t testing.TB, got, want K) {
 	}
 }
 
-func apiClient(t testing.TB, proxyS *nettest.Server, regions, max, orders int) (httpC *http.Client, baseURL string) {
+func apiClient(t testing.TB, regions, max, orders int) (httpC *http.Client, baseURL string) {
 	t.Helper()
 
 	mux := http.NewServeMux()
 
-	const start = 10000000
-	var rr = make([]int, regions)
-	for i := range regions {
-		rr[i] = start + (i + 1)
-	}
-
-	mux.HandleFunc("GET /v1/universe/regions", func(w http.ResponseWriter, r *http.Request) {
-		// select a slice of this
-
+	{ // GET /v1/universe/regions
+		const start = 10000000
+		var rr = make([]int, regions)
+		for i := range regions {
+			rr[i] = start + (i + 1)
+		}
 		p, err := json.Marshal(rr)
 		if err != nil {
 			t.Fail()
 		}
-		w.Header().Set("Content-Length", strconv.Itoa(len(p)))
 
-		if _, err := w.Write(p); err != nil {
-			t.Fail()
-		}
-	})
+		mux.HandleFunc("GET /v1/universe/regions", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", strconv.Itoa(len(p)))
 
-	mux.HandleFunc("HEAD /v1/markets/{id}/orders", func(w http.ResponseWriter, r *http.Request) {
-		_, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
-		if err != nil {
-			t.Fail()
-		}
-		w.Header().Set("x-pages", strconv.Itoa(max))
-	})
-
-	var oo = make([]evetech.Order, orders)
-	for i := range orders {
-		oo[i] = evetech.Order{
-			OrderID:      i + 1,
-			IsBuyOrder:   false, // or true
-			Issued:       "issued",
-			LocationID:   1,
-			MinVolume:    1,
-			Price:        1,
-			Range:        "range",
-			SystemID:     1,
-			TypeID:       1,
-			VolumeRemain: 1,
-			VolumeTotal:  1,
-		}
+			if _, err := w.Write(p); err != nil {
+				t.Fail()
+			}
+		})
 	}
 
-	mux.HandleFunc("GET /v1/markets/{id}/orders", func(w http.ResponseWriter, r *http.Request) {
-		_, err1 := strconv.ParseUint(r.PathValue("id"), 10, 64)
-		_, err2 := strconv.ParseUint(r.URL.Query().Get("page"), 10, 64)
-		if err := cmp.Or(err1, err2); err != nil {
-			t.Fail()
-		}
+	{ // HEAD /v1/markets/{id}/orders
+		mux.HandleFunc("HEAD /v1/markets/{id}/orders", func(w http.ResponseWriter, r *http.Request) {
+			_, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
+			if err != nil {
+				t.Fail()
+			}
+			w.Header().Set("x-pages", strconv.Itoa(max))
+		})
+	}
 
+	{ // GET /v1/markets/{id}/orders
+		var oo = make([]evetech.Order, orders)
+		for i := range orders {
+			oo[i] = evetech.Order{
+				OrderID:      i + 1,
+				IsBuyOrder:   false, // or true
+				Issued:       "issued",
+				LocationID:   1,
+				MinVolume:    1,
+				Price:        1,
+				Range:        "range",
+				SystemID:     1,
+				TypeID:       1,
+				VolumeRemain: 1,
+				VolumeTotal:  1,
+			}
+		}
 		p, err := json.Marshal(oo)
 		if err != nil {
 			t.Fail()
 		}
-		w.Header().Set("Content-Length", strconv.Itoa(len(p)))
 
-		if _, err := w.Write(p); err != nil {
-			t.Fail()
-		}
-	})
+		mux.HandleFunc("GET /v1/markets/{id}/orders", func(w http.ResponseWriter, r *http.Request) {
+			_, err1 := strconv.ParseUint(r.PathValue("id"), 10, 64)
+			_, err2 := strconv.ParseUint(r.URL.Query().Get("page"), 10, 64)
+			if err := cmp.Or(err1, err2); err != nil {
+				t.Fail()
+			}
+
+			w.Header().Set("Content-Length", strconv.Itoa(len(p)))
+
+			if _, err := w.Write(p); err != nil {
+				t.Fail()
+			}
+		})
+	}
 
 	s := httptest.NewServer(mux)
 	// See https://martin.baillie.id/wrote/gotchas-in-the-go-network-packages-defaults/
@@ -199,34 +191,7 @@ func apiClient(t testing.TB, proxyS *nettest.Server, regions, max, orders int) (
 		tr.IdleConnTimeout = 90 * time.Second
 	}
 
-	if proxyS == nil {
-		return s.Client(), s.URL
-	}
-
-	// applying a proxy infront of the api seems to make a difference in the speeds
-	// when configured to regions
-	hostport, err := proxyS.Client().Proxy("api", strings.TrimPrefix(s.URL, "http://"))
-	ok(t, err)
-
-	set, stop := proxyS.Client().Bandwidth("api", nettest.Downstream, 1000) // 1mbps
-	if set {
-		t.Cleanup(stop)
-	}
-	equal(t, set, true)
-
-	set, stop = proxyS.Client().Latency("api", nettest.Downstream, 50, 25)
-	if set {
-		t.Cleanup(stop)
-	}
-	equal(t, set, true)
-
-	parsed, err := url.Parse(s.URL)
-	ok(t, err)
-	parsed.Host = hostport
-
-	return s.Client(), parsed.String()
-	// return s.Client(), s.URL
-	// no-proxy (53.001152ms), proxy (62.206ms)
+	return s.Client(), s.URL
 }
 
 func newProxyServer(t testing.TB) *nettest.Server {
