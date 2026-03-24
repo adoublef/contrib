@@ -57,7 +57,12 @@ async fn zip_chapter(
             let stream = SyncIoBridge::new(StreamReader::new(response.map_err(io::Error::other)));
             for res in images(stream) {
                 let res = res?;
-                tx.blocking_send(res).unwrap(); // we dont like unwrap here
+                let path = res
+                    .path_segments()
+                    .ok_or_else(|| format_err!("URL has no path segments: {}", res))?
+                    .collect::<Vec<_>>();
+                // image should have a segment
+                tx.blocking_send(res)?; // we dont like unwrap here
             }
             Ok::<_, anyhow::Error>(())
         });
@@ -139,7 +144,12 @@ async fn zip_series(
             let stream = SyncIoBridge::new(StreamReader::new(response.map_err(io::Error::other)));
             for res in anchors(stream) {
                 let res = res?;
-                tx.blocking_send(res).unwrap(); // we dont like unwrap here
+                let path = res
+                    .path_segments()
+                    .ok_or_else(|| format_err!("URL has no path segments: {}", res))?
+                    .collect::<Vec<_>>();
+                // chapter should have a segment
+                tx.blocking_send(res)?;
             }
             Ok::<_, anyhow::Error>(())
         });

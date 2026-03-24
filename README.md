@@ -10,3 +10,6 @@
 - [Async deserializing an array of json as a stream](https://users.rust-lang.org/t/async-deserializing-an-array-of-json-as-a-stream/60299/3)
 - [Darksonn/backblaze-b2-rs](https://github.com/Darksonn/backblaze-b2-rs/tree/ver0.2/src/b2_future)
 - [Async rust: server-sent events with a remote heartbeat](https://elfsternberg.com/blog/axum-sse-remote-heartbeat/#NWD4PsPaR-5)
+- [Dependency injection in Axum handlers. A quick tour](https://tulipemoutarde.be/posts/2023-08-20-depencency-injection-rust-axum/)
+- [backblaze-b2-rs](https://github.com/Darksonn/backblaze-b2-rs/tree/ver0.2/src/b2_future)
+- [hyper-json-stream](https://github.com/arnaudpoullet/hyper-json-stream/blob/main/README.md)

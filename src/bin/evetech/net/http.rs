@@ -7,18 +7,23 @@ use axum::{
     http::Response,
     routing::get,
 };
-use csv_async::AsyncSerializer;
-use futures_util::{Stream, StreamExt, TryStreamExt, stream::iter};
+use csv_async::{AsyncWriterBuilder, Terminator};
+use futures_util::{Stream, StreamExt, TryStreamExt};
+use http_json_stream::{JsonPart, JsonStream};
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use std::io;
-use tokio::{io::duplex, spawn, sync::mpsc};
+use std::marker::Send;
+use tokio::{io::duplex, sync::mpsc, task::JoinSet};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
+use tracing::{Instrument, trace_span};
 use url::Url;
 
 pub fn app(client: Client) -> Router {
-    Router::new().route("/", get(handle_csv)).with_state(client)
+    Router::new()
+        .route("/", get(handle_csv))
+        .with_state(AppState(client))
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -37,121 +42,161 @@ pub struct Order {
     volume_total: i64,
 }
 
-async fn csv_reader(client: Client, base_url: Url) -> impl Stream<Item = Result<Bytes, io::Error>> {
-    let (rx, tx) = duplex(4 * 1 << 10);
-    let fut = spawn(async move {
-        // create csv writer
-        let mut wri = AsyncSerializer::from_writer(tx);
-        // TODO - stream json body
-        let regions = iter(
-            client
+#[derive(Debug, Clone)]
+struct AppState(Client);
+
+async fn csv_stream(
+    client: Client,
+    base_url: Url,
+    has_header: bool, // better to be a config map
+) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
+    let mut set = JoinSet::new();
+
+    let (tx, regions) = mpsc::channel(1);
+    set.spawn({
+        let client = client.clone();
+        let base_url = base_url.clone();
+        async move {
+            let response = client
                 .get(base_url.join("/v1/universe/regions")?)
                 .send()
                 .await?
-                .error_for_status()?
-                .json::<Vec<u32>>()
-                .await?,
-        );
+                .error_for_status()?;
+            // check the content-type & and content-length
+            let mut stream = JsonStream::<_, _, u32>::process(response, JsonPart::level(1));
 
-        let (tx, rx) = mpsc::channel(1);
-        let fut_regions = spawn({
-            let client = client.clone();
-            let base_url = base_url.clone();
-            async move {
-                regions
-                    .map(Ok::<_, anyhow::Error>)
-                    .try_for_each_concurrent(1, |region| {
-                        let tx = tx.clone();
-                        let client = client.clone();
-                        let base_url = base_url.clone();
-                        async move {
-                            let last = client
-                                .head(base_url.join(&format!("/v1/markets/{region}/orders"))?)
-                                .send()
-                                .await?
-                                .error_for_status()?
-                                .headers()
-                                .get("x-pages")
-                                .context("Missing x-pages header")?
-                                .to_str()?
-                                .parse::<u32>()?;
-
-                            for page in 1..=last {
-                                tx.send((region, page)).await?;
-                            }
-                            Ok::<_, anyhow::Error>(())
-                        }
-                    })
-                    .await?;
-                Ok::<_, anyhow::Error>(())
+            while let Some(id) = stream
+                .try_next()
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?
+            {
+                tx.send(id).await?;
             }
-        });
-
-        let pages = ReceiverStream::new(rx);
-        let (tx, mut rx) = mpsc::channel(1);
-        let fut_pages = spawn({
-            let client = client.clone();
-            let base_url = base_url.clone();
-            async move {
-                pages
-                    .map(Ok::<_, anyhow::Error>)
-                    .try_for_each_concurrent(1, |(region, page)| {
-                        let tx = tx.clone();
-                        let client = client.clone();
-                        let base_url = base_url.clone();
-                        async move {
-                            let orders =
-                                client
-                                    .get(base_url.join(&format!(
-                                        "/v1/markets/{region}/orders?page={page}"
-                                    ))?)
-                                    .send()
-                                    .await?
-                                    .error_for_status()?
-                                    .json::<Vec<Order>>()
-                                    .await?;
-
-                            // while let broke this
-                            for order in orders {
-                                tx.send(order).await?;
-                            }
-                            Ok::<_, anyhow::Error>(())
-                        }
-                    })
-                    .await?;
-                Ok::<_, anyhow::Error>(())
-            }
-        });
-
-        while let Some(order) = rx.recv().await {
-            wri.serialize(&order).await?;
+            Ok::<_, anyhow::Error>(())
         }
-        fut_regions.await??;
-        fut_pages.await??;
-        wri.flush().await?;
-
-        Ok::<_, anyhow::Error>(())
+        .instrument(trace_span!("regions"))
     });
+
+    let (tx, queries) = mpsc::channel(1);
+    set.spawn({
+        let client = client.clone();
+        let base_url = base_url.clone();
+        async move {
+            ReceiverStream::new(regions)
+                .map(Ok::<_, anyhow::Error>)
+                .try_for_each_concurrent(1, |region| {
+                    let tx = tx.clone();
+                    let client = client.clone();
+                    let base_url = base_url.clone();
+                    async move {
+                        let last = client
+                            .head(base_url.join(&format!("/v1/markets/{region}/orders"))?)
+                            .send()
+                            .await?
+                            .error_for_status()?
+                            .headers()
+                            .get("x-pages")
+                            .context("Missing x-pages header")?
+                            .to_str()?
+                            .parse::<u32>()?;
+
+                        for page in 1..=last {
+                            tx.send((region, page)).await?;
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    }
+                    .instrument(trace_span!("pages"))
+                })
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        }
+    });
+
+    let (tx, mut orders) = mpsc::channel(1);
+    set.spawn({
+        let client = client.clone();
+        let base_url = base_url.clone();
+        async move {
+            ReceiverStream::new(queries)
+                .map(Ok::<_, anyhow::Error>)
+                .try_for_each_concurrent(1, |(region, page)| {
+                    let tx = tx.clone();
+                    let client = client.clone();
+                    let base_url = base_url.clone();
+                    async move {
+                        let response = client
+                            .get(
+                                base_url
+                                    .join(&format!("/v1/markets/{region}/orders?page={page}"))?,
+                            )
+                            .send()
+                            .await?
+                            .error_for_status()?;
+                        // support ndjson &/or jsonl
+                        // check the content-type & and content-length
+                        let mut stream =
+                            JsonStream::<_, _, Order>::process(response, JsonPart::level(1));
+
+                        while let Some(order) = stream
+                            .try_next()
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                        {
+                            tx.send(order).await?;
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    }
+                    .instrument(trace_span!("orders"))
+                })
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        }
+    });
+
+    let (rx, tx) = duplex(4 << 10);
+    set.spawn({
+        async move {
+            let mut wri = AsyncWriterBuilder::new()
+                .has_headers(has_header) // no header
+                .buffer_capacity(4 << 10)
+                .terminator(Terminator::CRLF)
+                .create_serializer(tx);
+            while let Some(order) = orders.recv().await {
+                wri.serialize(&order).await?;
+            }
+            wri.flush().await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .instrument(trace_span!("csv"))
+    });
+
     let mut stream = ReaderStream::new(rx);
     try_stream! {
         while let Some(msg) = stream.next().await {
             let msg = msg?; // Result<Bytes, Error>
             yield msg
         }
-        fut.await?.map_err(io::Error::other)?
+        for res in set.join_all().await {
+            res.map_err(io::Error::other)?;
+        }
     }
 }
 
 #[derive(Deserialize)]
 struct CsvParams {
-    base_url: Url, // Url does not satisfy Deserialize?
+    base_url: Url,
+    has_header: Option<bool>,
 }
 
 async fn handle_csv(
-    State(client): State<Client>,
-    Query(CsvParams { base_url }): Query<CsvParams>,
+    State(AppState(client)): State<AppState>,
+    Query(CsvParams {
+        base_url,
+        has_header,
+    }): Query<CsvParams>,
 ) -> Response<Body> {
-    let stream = csv_reader(client, base_url).await;
+    let has_header = has_header.unwrap_or_default();
+    let stream = csv_stream(client, base_url, has_header).await;
     Response::builder()
         .header(header::CONTENT_TYPE, mime::TEXT_CSV.essence_str())
         .header(
@@ -173,7 +218,8 @@ mod test {
         http::Response,
         routing::{get, head},
     };
-    use csv_async::AsyncReader;
+    use csv_async::AsyncReaderBuilder;
+    use dial9_tokio_telemetry::telemetry::{RotatingWriter, TracedRuntime};
     use futures_util::TryStreamExt;
     use reqwest::{Client, StatusCode, header};
     use std::io;
@@ -182,37 +228,63 @@ mod test {
     use tokio_util::io::StreamReader;
     use url::Url;
 
-    #[tokio::test]
-    async fn test_csv_ok() -> anyhow::Result<()> {
-        let num_regions = 1 << 2;
-        let num_pages = 1 << 1;
-        let num_orders = 1 << 2;
+    // #[tokio::test]
+    #[test]
+    fn test_csv_ok() -> anyhow::Result<()> {
+        // https://docs.rs/dial9-tokio-telemetry/latest/dial9_tokio_telemetry/#quick-start
+        // https://dial9-tokio-telemetry.russell-r-cohen.workers.dev/
+        let trace_path = "./trace.bin";
+        let writer = RotatingWriter::single_file(trace_path)?;
 
-        let (client, api_url) = api_serve(num_regions, num_pages, num_orders).await?;
-        let (client, mut url) = serve(client).await?;
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all(); // builder.worker_threads(4).enable_all();
 
-        url.query_pairs_mut()
-            .append_pair("base_url", api_url.as_str());
+        let (runtime, _guard) = TracedRuntime::builder()
+            .with_task_tracking(true)
+            .with_trace_path(trace_path)
+            .build_and_start(builder, writer)?;
 
-        let response = client.get(url).send().await?;
-        assert_eq!(response.status(), StatusCode::OK);
-        let headers = response.headers();
-        let content_type = headers
-            .get(header::CONTENT_TYPE)
-            .context("Missing content-type header")?;
-        assert_eq!(content_type, mime::TEXT_CSV.as_ref());
+        runtime.block_on(async {
+            let num_regions = 1 << 3;
+            let num_pages = 1 << 3;
+            let num_orders = 1 << 3;
 
-        let mut rdr = AsyncReader::from_reader(StreamReader::new(
-            response.bytes_stream().map_err(io::Error::other),
-        ));
-        let mut records = rdr.records();
-        let mut num_records = 0;
-        while let Some(record) = records.next().await {
-            let record = record?;
-            assert_eq!(record.len(), 12);
-            num_records += 1;
-        }
-        assert_eq!(num_records, num_regions * num_pages * num_orders);
+            let has_header = false;
+
+            let (client, api_url) = api_serve(num_regions, num_pages, num_orders).await?;
+            let (client, mut url) = serve(client).await?;
+
+            url.query_pairs_mut()
+                .append_pair("base_url", api_url.as_str());
+
+            let response = client.get(url).send().await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let headers = response.headers();
+            let content_type = headers
+                .get(header::CONTENT_TYPE)
+                .context("Missing content-type header")?;
+            assert_eq!(content_type, mime::TEXT_CSV.as_ref());
+            // check content-disposition
+
+            // include this info in the headers of the request
+            // or the query, so that we can use that in our reader
+            let mut rdr = AsyncReaderBuilder::new()
+                .has_headers(has_header)
+                .buffer_capacity(4 << 10) // not my concern?
+                .create_reader(StreamReader::new(
+                    response.bytes_stream().map_err(io::Error::other),
+                ));
+            let mut records = rdr.records();
+            let mut num_records = 0;
+            while let Some(record) = records.next().await {
+                let record = record?;
+                assert_eq!(record.len(), 12);
+                num_records += 1;
+            }
+            assert_eq!(num_records, num_regions * num_pages * num_orders);
+
+            Ok::<_, anyhow::Error>(())
+        })?;
 
         Ok(())
     }
