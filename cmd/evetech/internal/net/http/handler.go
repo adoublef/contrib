@@ -17,6 +17,9 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+const defaultChanSize = 1
+const defaultWorkerLimit = 1 << 0
+
 type (
 	Server = http.Server
 	Client = http.Client
@@ -33,7 +36,7 @@ func Handler(httpC *http.Client) http.Handler {
 func csvStream(ctx context.Context, httpC *http.Client, u *url.URL, hasHeader bool) io.ReadCloser {
 	g, ctx := errgroup.WithContext(ctx)
 
-	regions := make(chan uint64)
+	regions := make(chan uint64, defaultChanSize)
 	g.Go(func() error {
 		ctx, task := trace.NewTask(ctx, "regions")
 		defer func() { close(regions); task.End() }()
@@ -63,12 +66,12 @@ func csvStream(ctx context.Context, httpC *http.Client, u *url.URL, hasHeader bo
 	type query struct {
 		region, page uint64 // n > 0
 	}
-	queries := make(chan query)
+	queries := make(chan query, defaultChanSize)
 	g.Go(func() error {
 		defer func() { close(queries) }()
 
 		g, ctx := errgroup.WithContext(ctx)
-		g.SetLimit(1 << 0)
+		g.SetLimit(defaultWorkerLimit)
 		for region := range regions {
 			g.Go(func() error {
 				ctx, task := trace.NewTask(ctx, "pages")
@@ -96,7 +99,7 @@ func csvStream(ctx context.Context, httpC *http.Client, u *url.URL, hasHeader bo
 		return g.Wait()
 	})
 
-	records := make(chan [12]string)
+	records := make(chan [12]string, defaultChanSize)
 	g.Go(func() error {
 		defer func() { close(records) }()
 
@@ -123,7 +126,7 @@ func csvStream(ctx context.Context, httpC *http.Client, u *url.URL, hasHeader bo
 		}
 
 		g, ctx := errgroup.WithContext(ctx)
-		g.SetLimit(1 << 0)
+		g.SetLimit(defaultWorkerLimit)
 		for query := range queries {
 			g.Go(func() error {
 				ctx, task := trace.NewTask(ctx, "orders")
@@ -157,10 +160,9 @@ func csvStream(ctx context.Context, httpC *http.Client, u *url.URL, hasHeader bo
 	pr, pw := io.Pipe() // there is no buffer here
 	g.Go(func() error {
 		cw := csv.NewWriter(pw) // 4*1<<10 buffer
-		cw.UseCRLF = true
+		cw.UseCRLF = true       // windows uses this
 
 		for record := range records {
-			// or do i create record local here
 			if err := cmp.Or(cw.Write(record[:]), ctx.Err()); err != nil {
 				return err
 			}
