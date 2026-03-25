@@ -20,13 +20,16 @@ use tokio_util::io::ReaderStream;
 use tracing::{Instrument, trace_span};
 use url::Url;
 
+const DEFAULT_CHAN_SIZE: usize = 1;
+const DEFAULT_WORKER_LIMIT: usize = 1 << 0;
+
 pub fn app(client: Client) -> Router {
     Router::new()
         .route("/", get(handle_csv))
         .with_state(AppState(client))
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Order {
     duration: i64,
     is_buy_order: bool,
@@ -52,7 +55,7 @@ async fn csv_stream(
 ) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
     let mut set = JoinSet::new();
 
-    let (tx, regions) = mpsc::channel(1);
+    let (tx, regions) = mpsc::channel(DEFAULT_CHAN_SIZE);
     set.spawn({
         let client = client.clone();
         let base_url = base_url.clone();
@@ -77,14 +80,14 @@ async fn csv_stream(
         .instrument(trace_span!("regions"))
     });
 
-    let (tx, queries) = mpsc::channel(1);
+    let (tx, queries) = mpsc::channel(DEFAULT_CHAN_SIZE);
     set.spawn({
         let client = client.clone();
         let base_url = base_url.clone();
         async move {
             ReceiverStream::new(regions)
                 .map(Ok::<_, anyhow::Error>)
-                .try_for_each_concurrent(1, |region| {
+                .try_for_each_concurrent(DEFAULT_WORKER_LIMIT, |region| {
                     let tx = tx.clone();
                     let client = client.clone();
                     let base_url = base_url.clone();
@@ -112,14 +115,14 @@ async fn csv_stream(
         }
     });
 
-    let (tx, mut orders) = mpsc::channel(1);
+    let (tx, mut orders) = mpsc::channel(DEFAULT_CHAN_SIZE);
     set.spawn({
         let client = client.clone();
         let base_url = base_url.clone();
         async move {
             ReceiverStream::new(queries)
                 .map(Ok::<_, anyhow::Error>)
-                .try_for_each_concurrent(1, |(region, page)| {
+                .try_for_each_concurrent(DEFAULT_WORKER_LIMIT, |(region, page)| {
                     let tx = tx.clone();
                     let client = client.clone();
                     let base_url = base_url.clone();
@@ -302,13 +305,14 @@ mod test {
 
         // a vector of ids (stargeting at 10000)
         // a vector of orders
+        let regions = (1..=num_regions).map(|n| 10000 + n).collect::<Vec<_>>();
+        let orders = (1..=num_orders)
+            .map(|_| Order::default())
+            .collect::<Vec<_>>();
 
         let app = Router::new()
             // GET "/v1/universe/regions"
-            .route(
-                "/v1/universe/regions",
-                get(async move |()| Json((1..=num_regions).map(|n| 10000 + n).collect::<Vec<_>>())),
-            )
+            .route("/v1/universe/regions", get(async move |()| Json(regions)))
             // HEAD "/v1/markets/{region}/orders"
             .route(
                 "/v1/markets/{region}/orders",
@@ -322,13 +326,7 @@ mod test {
             // GET "/v1/markets/{region}/orders?page={page}"
             .route(
                 "/v1/markets/{region}/orders",
-                get(async move |Path(_): Path<usize>| {
-                    Json(
-                        (1..=num_orders)
-                            .map(|_| Order::default())
-                            .collect::<Vec<_>>(),
-                    )
-                }),
+                get(async move |Path(_): Path<usize>| Json(orders)),
             );
 
         spawn(async move {
